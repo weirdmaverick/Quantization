@@ -1,5 +1,3 @@
-# onnx_quant_tinyllama_wikitext_tuned.py
-
 import sys
 import os
 import time
@@ -29,6 +27,7 @@ WEIGHT_TYPE = QuantType.QInt8
 MAX_LEN = 512
 ONNX_DIR_FP32 = "onnx_TinyLlama_fp32"
 ONNX_DIR_QUANT = "onnx_TinyLlama_int8"
+USE_IO_BINDING = True
 
 safe_model = MODEL_ID.replace("/", "_")
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -74,11 +73,11 @@ ds_tok = ds_raw.map(
 )
 ds_tok.set_format(type="np", columns=[
                   "input_ids", "attention_mask", "position_ids"])
-ds_tok = ds_tok.select(range(1))
+# ds_tok = ds_tok.select(range(1))
 print(f"[Data] Dataset ready ({len(ds_tok)} samples)\n")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 2. ONNX Export (fine-tuned Llama2 model load → ONNX)
+# 2. ONNX Export (fine-tuned Llama2 모델 로드 → ONNX)
 # ───────────────────────────────────────────────────────────────────────────────
 print(f"[Export] Exporting model to ONNX directory: {ONNX_DIR_FP32}")
 os.makedirs(ONNX_DIR_FP32, exist_ok=True)
@@ -90,11 +89,7 @@ onnx_model = ORTModelForCausalLM.from_pretrained(
     use_auth_token=True,
     trust_remote_code=True
 )
-onnx_model.save_pretrained(ONNX_DIR_FP32, opset_version =20)
-
-fp32_path = os.path.join(ONNX_DIR_FP32, "model.onnx")
-model = onnx.load_model(fp32_path, load_external_data=True)
-onnx.save_model(model, fp32_path, save_as_external_data=False)
+onnx_model.save_pretrained(ONNX_DIR_FP32)
 print(f"[Export] Completed ONNX export and saved to {ONNX_DIR_FP32}\n")
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -151,18 +146,21 @@ print(f"[Quantization] Completed quantization, saved to {ONNX_DIR_QUANT}\n")
 # 5. 평가 함수 (Inference & Profiling 포함)
 # ───────────────────────────────────────────────────────────────────────────────
 
-
-def evaluate_tuned(onnx_dir, ds, run_profile=RUN_PROFILE):
+def evaluate(onnx_dir, ds, run_profile=RUN_PROFILE):
     """
-    1) InferenceSession 생성 (스레드/메모리/프로파일링 옵션 포함)
+    1) InferenceSession 생성 (Thread/Memory/Profiling 옵션 포함)
     2) Warm-up
-    3) 실제 추론 및 시간 측정
+    3) Inference (io_binding 사용 여부에 따라 분기)
     4) 프로파일링 파일 경로 반환
-    5) 모델 파일 크기 반환
+    5) Model File size return
     """
+    # ONNX 파일 경로
     onnx_paths = glob.glob(os.path.join(onnx_dir, "*.onnx"))
+    if not onnx_paths:
+        raise RuntimeError(f"No ONNX model found in directory: {onnx_dir}")
     model_path = onnx_paths[0]
 
+    # SessionOptions 튜닝
     sess_opts = SessionOptions()
 
     # Profiling 활성화
@@ -171,52 +169,106 @@ def evaluate_tuned(onnx_dir, ds, run_profile=RUN_PROFILE):
         sess_opts.profile_file_prefix = f"{safe_model}_{onnx_dir}_{timestamp}"
 
     # 스레드 및 메모리 옵션
-    sess_opts.inter_op_num_threads = 1
-    sess_opts.intra_op_num_threads = 8
-    sess_opts.enable_cpu_mem_arena = True
-    sess_opts.enable_mem_pattern = True
-    sess_opts.execution_mode = ExecutionMode.ORT_SEQUENTIAL
-    sess_opts.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_opts.log_severity_level = 2  # WARNING
+    sess_opts.inter_op_num_threads       = 1
+    sess_opts.intra_op_num_threads       = 20
+    sess_opts.enable_cpu_mem_arena       = True
+    sess_opts.enable_mem_pattern         = True
+    sess_opts.execution_mode             = ExecutionMode.ORT_PARALLEL # ExecutionMode.ORT_SEQUENTIAL 
+    sess_opts.graph_optimization_level   = GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.log_severity_level         = 2  # WARNING
 
     # InferenceSession 생성
     session = InferenceSession(model_path, sess_opts)
 
     # 입력 이름
-    input_names = ["input_ids", "attention_mask", "position_ids"]
+    input_names = ["input_ids", "attention_mask"]
+    # 출력 이름: casual LM의 경우 logits
+    output_names = [o.name for o in session.get_outputs()]
 
-    # Warm-up
+    # Warm-up (기존 코드는 session.run 이용)
     print(f"[Evaluate] Warming up for {WARMUP_STEPS} steps on {onnx_dir}...")
     for ex in ds.select(range(min(WARMUP_STEPS, len(ds)))):
         feed = {
-            "input_ids":      np.array(ex["input_ids"],     dtype=np.int64).reshape(1, MAX_LEN),
-            "attention_mask": np.array(ex["attention_mask"], dtype=np.int64).reshape(1, MAX_LEN),
-            "position_ids":   np.array(ex["position_ids"],   dtype=np.int64).reshape(1, MAX_LEN)
+            "input_ids":      np.array(ex["input_ids"],     dtype=np.int64).reshape(1, MAX_LENGTH),
+            "attention_mask": np.array(ex["attention_mask"], dtype=np.int64).reshape(1, MAX_LENGTH),
         }
         session.run(None, feed)
 
-    # 실제 추론 및 시간 측정
+    # 실제 추론: io_binding 사용 여부 분기
     total_t = 0.0
-    for ex in tqdm(ds, desc=f"[Evaluate] Running inference on {onnx_dir}"):
-        ids = ex["input_ids"][:MAX_LEN]
-        msk = ex["attention_mask"][:MAX_LEN]
-        pos = ex["position_ids"][:MAX_LEN]
-        # 패딩
-        if ids.shape[0] < MAX_LEN:
-            pad = MAX_LEN - ids.shape[0]
-            ids = np.pad(ids, (0, pad), constant_values=tokenizer.pad_token_id)
-            msk = np.pad(msk, (0, pad), constant_values=0)
-            pos = np.pad(pos, (0, pad), constant_values=0)
-        feed = {
-            "input_ids":      np.array(ids, dtype=np.int64).reshape(1, MAX_LEN),
-            "attention_mask": np.array(msk, dtype=np.int64).reshape(1, MAX_LEN),
-            "position_ids":   np.array(pos, dtype=np.int64).reshape(1, MAX_LEN)
-        }
-        t0 = time.time()
-        session.run(None, feed)
-        total_t += time.time() - t0
+    if USE_IO_BINDING:
+        # 1) IOBinding 객체 생성
+        io_binding = session.io_binding()
 
-    # Profiling 파일 수집
+        # 2) 입력, 출력 버퍼 고정 (한 번만 shape 설정)
+        #    batch=1, seq_len=MAX_LENGTH로 고정하여 bind
+        dummy_input_ids = np.zeros((1, MAX_LENGTH), dtype=np.int64)
+        dummy_attention_mask = np.zeros((1, MAX_LENGTH), dtype=np.int64)
+
+        io_binding.bind_input(
+            name="input_ids",
+            device_type="cpu",
+            device_id=0,
+            element_type=np.int64,
+            shape=dummy_input_ids.shape,
+            buffer_ptr=dummy_input_ids.ctypes.data
+        )
+        io_binding.bind_input(
+            name="attention_mask",
+            device_type="cpu",
+            device_id=0,
+            element_type=np.int64,
+            shape=dummy_attention_mask.shape,
+            buffer_ptr=dummy_attention_mask.ctypes.data
+        )
+        # 출력 logits 바인딩 (크기: [1, seq_len, vocab_size] → seq_len=MAX_LENGTH)
+        # 온전히 추론 시 vocab_size는 session.get_outputs()[0].shape[2]로 확인 가능
+        out_shape = (1, MAX_LENGTH, session.get_outputs()[0].shape[2])
+        io_binding.bind_output(
+            name=output_names[0],
+            device_type="cpu",
+            device_id=0,
+            element_type=np.float32,
+            shape=out_shape,
+            buffer_ptr=None  # ONNX Runtime이 내부 버퍼 할당
+        )
+
+        # 3) 반복 추론 루프
+        for ex in tqdm(ds, desc=f"[Evaluate] Running inference w/ IO Binding on {onnx_dir}"):
+            ids = ex["input_ids"][:MAX_LENGTH]
+            msk = ex["attention_mask"][:MAX_LENGTH]
+            if ids.shape[0] < MAX_LENGTH:
+                pad = MAX_LENGTH - ids.shape[0]
+                ids = np.pad(ids, (0, pad), constant_values=tokenizer.pad_token_id)
+                msk = np.pad(msk, (0, pad), constant_values=0)
+
+            # 실제 입력 배열을 io_binding의 input_ids/attention_mask 버퍼에 복사
+            np.copyto(dummy_input_ids, ids.reshape(1, MAX_LENGTH))
+            np.copyto(dummy_attention_mask, msk.reshape(1, MAX_LENGTH))
+
+            t0 = time.time()
+            session.run_with_iobinding(io_binding)
+            total_t += time.time() - t0
+
+    else:
+        # 기존 run() 방식
+        for ex in tqdm(ds, desc=f"[Evaluate] Running inference on {onnx_dir}"):
+            ids = ex["input_ids"][:MAX_LENGTH]
+            msk = ex["attention_mask"][:MAX_LENGTH]
+            if ids.shape[0] < MAX_LENGTH:
+                pad = MAX_LENGTH - ids.shape[0]
+                ids = np.pad(ids, (0, pad), constant_values=tokenizer.pad_token_id)
+                msk = np.pad(msk, (0, pad), constant_values=0)
+
+            feed = {
+                "input_ids":      np.array(ids, dtype=np.int64).reshape(1, MAX_LENGTH),
+                "attention_mask": np.array(msk, dtype=np.int64).reshape(1, MAX_LENGTH),
+            }
+            t0 = time.time()
+            session.run(None, feed)
+            total_t += time.time() - t0
+
+    # Profiling 파일 경로 반환
     prof_path = None
     if run_profile:
         prof_path = session.end_profiling()
@@ -227,11 +279,30 @@ def evaluate_tuned(onnx_dir, ds, run_profile=RUN_PROFILE):
     data_file = os.path.join(onnx_dir, "model.onnx_data")
     if os.path.exists(data_file):
         size_files.append(data_file)
-    total_bytes = sum(os.path.getsize(f)
-                      for f in size_files if os.path.exists(f))
+    total_bytes = sum(os.path.getsize(f) for f in size_files if os.path.exists(f))
     size_mb = total_bytes / 1e6
 
     return total_t, size_mb, prof_path
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 6. FP32 vs INT8 비교 및 출력
+# ───────────────────────────────────────────────────────────────────────────────
+results = {}
+for tag, d in [("FP32", ONNX_FP32_DIR), ("INT8", ONNX_INT8_DIR)]:
+    print(f"\n[Compare] Evaluating {tag} model...")
+    t, s, p = evaluate(d, ds_tok)
+    results[tag] = {"time": t, "size": s, "profile": p}
+    print(f"{tag}: time={t:.2f}s | size={s:.2f}MB")
+    if p:
+        print(f"  → Profile: {p}")
+
+fp = results["FP32"]
+qt = results["INT8"]
+print(
+    f"\n[Result] Size Reduction   : {(fp['size'] - qt['size']) / fp['size'] * 100:.1f}%")
+print(
+    f"[Result] Latency Speed-up : {(fp['time'] - qt['time']) / fp['time'] * 100:.1f}%\n")
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -255,6 +326,62 @@ if fp["time"] > 0:
         f"[Result] Latency Speed-up : {(fp['time'] - qt['time']) / fp['time'] * 100:.1f}%\n")
 else:
     print("[Result] Latency Speed-up : N/A (FP32 time = 0)\n")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 7. Quant Kernel 실행시간 비율 (Profiling JSON 분석)
+# ───────────────────────────────────────────────────────────────────────────────
+events = []
+pattern = re.compile(
+    r'^(DynamicQuantizeLinear|DynamicQuantizeMatMul|MatMulIntegerToFloat|QLinearGemm)$')
+
+for f in glob.glob(f"{safe_model}_*.json"):
+    if os.path.getsize(f) == 0:
+        print(f"[Profile] Skipping empty profile file: {f}")
+        continue
+    with open(f, "r") as fp:
+        try:
+            data = json.load(fp)
+        except json.JSONDecodeError:
+            print(f"[Profile] Invalid JSON in {f}, skipping.")
+            continue
+    if isinstance(data, dict) and "events" in data:
+        events.extend(data["events"])
+    elif isinstance(data, list):
+        events.extend(data)
+    else:
+        raise ValueError(f"Unexpected profile format in {f}")
+
+qt_us = sum(ev.get("dur", 0) for ev in events if pattern.match(
+    ev.get("args", {}).get("op_name", ev.get("name", ""))))
+tot_us = sum(ev.get("dur", 0) for ev in events)
+
+if tot_us > 0:
+    print(
+        f"[Profile] Quantized Kernel Time: {qt_us/1e6:.3f}s / Total: {tot_us/1e6:.3f}s ({qt_us/tot_us*100:.1f}%)")
+else:
+    print("[Profile] No profile data or zero total time; skipping Quant Kernel ratio.")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 8. Quant/Dequant 연산자 비율 (Graph 분석)
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+def quant_op_ratio(onnx_path):
+    mdl = onnx.load(onnx_path)
+    ops = [node.op_type for node in mdl.graph.node]
+    total = len(ops)
+    q_ops = [op for op in ops if any(q in op for q in [
+        "DynamicQuantizeLinear", "DynamicQuantizeMatMul", "MatMulIntegerToFloat", "QLinearGemm"
+    ])]
+    return len(q_ops), total, len(q_ops) / total * 100 if total else 0
+
+
+for name, path in [
+    ("FP32", os.path.join(ONNX_DIR_FP32, "model.onnx")),
+    ("Quant", os.path.join(ONNX_DIR_QUANT, "model.onnx"))
+]:
+    qn, tot, pct = quant_op_ratio(path)
+    print(f"[{name}] {qn}/{tot} QuantOps ({pct:.2f}%)")
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 스크립트 종료
